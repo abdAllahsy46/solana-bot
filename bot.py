@@ -65,77 +65,65 @@ async def get_sol_price():
             return p
     except: return state["last_sol_price"] or 150.0
 
+new_tokens_queue = asyncio.Queue()
+
+async def pump_websocket_listener():
+    """استماع لتوكنات Pump.fun الجديدة عبر WebSocket"""
+    import websockets
+    uri = "wss://pumpportal.fun/api/data"
+    while True:
+        try:
+            async with websockets.connect(uri) as ws:
+                # اشترك في التوكنات الجديدة
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                log.info("✅ متصل بـ PumpPortal WebSocket")
+                async for msg in ws:
+                    try:
+                        data = json.loads(msg)
+                        if data.get("mint") and not data.get("complete"):
+                            await new_tokens_queue.put({
+                                "mint": data.get("mint"),
+                                "name": data.get("name", "Unknown"),
+                                "symbol": data.get("symbol", "???"),
+                                "usd_market_cap": data.get("usdMarketCap", 0),
+                                "created_timestamp": datetime.now().timestamp() * 1000,
+                                "complete": False,
+                            })
+                    except: continue
+        except Exception as e:
+            log.error(f"WebSocket خطأ: {e} - إعادة الاتصال بعد 5 ثوانٍ")
+            await asyncio.sleep(5)
+
 async def get_new_pump_tokens():
-    """جلب التوكنات الجديدة - يجرب عدة مصادر"""
-    
-    # مصدر 1: DexScreener API (موثوق جداً)
+    """جلب التوكنات من الـ queue"""
+    tokens = []
     try:
-        async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as h:
-            r = await h.get("https://api.dexscreener.com/token-profiles/latest/v1")
-            if r.status_code == 200:
-                data = r.json()
-                tokens = []
-                for item in data:
-                    if item.get("chainId") == "solana":
-                        tokens.append({
-                            "mint": item.get("tokenAddress"),
-                            "name": item.get("description", "Unknown")[:20],
-                            "symbol": item.get("url", "???").split("/")[-1][:10],
-                            "usd_market_cap": 5000,
-                            "created_timestamp": (datetime.now().timestamp() - 60) * 1000,
-                            "complete": False,
-                        })
-                if tokens:
-                    log.info(f"DexScreener: {len(tokens)} توكن")
-                    return tokens
-    except Exception as e:
-        log.error(f"DexScreener error: {e}")
+        while not new_tokens_queue.empty():
+            tokens.append(await new_tokens_queue.get())
+    except: pass
 
-    # مصدر 2: Pump.fun عبر proxy headers
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Origin": "https://pump.fun",
-            "Referer": "https://pump.fun/",
-        }
-        async with httpx.AsyncClient(timeout=15, headers=headers) as h:
-            r = await h.get("https://frontend-api.pump.fun/coins",
-                           params={"limit": 50, "sort": "created_timestamp",
-                                   "order": "DESC", "includeNsfw": "false"})
-            if r.status_code == 200:
-                log.info("Pump.fun API يعمل!")
-                return r.json()
-    except Exception as e:
-        log.error(f"Pump.fun error: {e}")
+    # إذا الـ queue فارغ جرب DexScreener كاحتياط
+    if not tokens:
+        try:
+            async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0"}) as h:
+                r = await h.get("https://api.dexscreener.com/token-boosts/latest/v1")
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, list):
+                        for item in data[:10]:
+                            if item.get("chainId") == "solana":
+                                tokens.append({
+                                    "mint": item.get("tokenAddress"),
+                                    "name": item.get("description", "Unknown")[:20],
+                                    "symbol": "???",
+                                    "usd_market_cap": 5000,
+                                    "created_timestamp": (datetime.now().timestamp() - 30) * 1000,
+                                    "complete": False,
+                                })
+        except Exception as e:
+            log.error(f"DexScreener error: {e}")
 
-    # مصدر 3: Bitquery - بيانات Solana
-    try:
-        async with httpx.AsyncClient(timeout=15) as h:
-            r = await h.get("https://streaming.bitquery.io/graphql",
-                           headers={"Content-Type": "application/json"},
-                           content=json.dumps({"query": """{ Solana { DEXTrades(limit: {count: 20} orderBy: {descending: Block_Time} where: {Trade: {Dex: {ProtocolName: {is: "pump"}}}}) { Trade { Buy { Currency { MintAddress Name Symbol } } } } } }"""}))
-            if r.status_code == 200:
-                trades = r.json().get("data", {}).get("Solana", {}).get("DEXTrades", [])
-                tokens = []
-                for t in trades:
-                    cur = t.get("Trade", {}).get("Buy", {}).get("Currency", {})
-                    mint = cur.get("MintAddress")
-                    if mint:
-                        tokens.append({
-                            "mint": mint,
-                            "name": cur.get("Name", "Unknown"),
-                            "symbol": cur.get("Symbol", "???"),
-                            "usd_market_cap": 5000,
-                            "created_timestamp": (datetime.now().timestamp() - 30) * 1000,
-                            "complete": False,
-                        })
-                if tokens:
-                    return tokens
-    except Exception as e:
-        log.error(f"Bitquery error: {e}")
-
-    return []
+    return tokens
 
 async def get_token_price_sol(mint):
     """سعر التوكن من DexScreener"""
@@ -307,9 +295,10 @@ async def handle_buttons(update, ctx):
     if q.data == "toggle":
         state["running"] = not state["running"]
         if state["running"]:
+            asyncio.create_task(pump_websocket_listener())
             asyncio.create_task(pump_sniper_loop(ctx.application))
             asyncio.create_task(monitor_positions(ctx.application))
-        txt = "✅ *القناص يعمل!*\nيراقب Pump.fun ويشتري كل توكن جديد 🎯" if state["running"] else "⛔ البوت متوقف."
+        txt = "✅ *القناص يعمل!*\nمتصل بـ Pump.fun WebSocket ويشتري كل توكن جديد 🎯" if state["running"] else "⛔ البوت متوقف."
         await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb())
 
     elif q.data == "status":
@@ -401,9 +390,10 @@ async def handle_message(update, ctx):
 
     if any(w in txt for w in ["شغل", "تشغيل", "ابدأ"]):
         state["running"] = True
+        asyncio.create_task(pump_websocket_listener())
         asyncio.create_task(pump_sniper_loop(ctx.application))
         asyncio.create_task(monitor_positions(ctx.application))
-        await update.message.reply_text("✅ القناص يعمل! 🎯", reply_markup=kb()); return
+        await update.message.reply_text("✅ القناص يعمل! متصل بـ Pump.fun 🎯", reply_markup=kb()); return
 
     nums = re.findall(r'\d+\.?\d*', txt)
     if "حجم الصفقة" in txt and nums:
