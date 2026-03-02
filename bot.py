@@ -1,4 +1,4 @@
-import os, asyncio, logging, httpx, base58, re
+import os, asyncio, logging, httpx, base58, re, json
 from datetime import datetime, time as dtime
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -7,10 +7,8 @@ from solana.rpc.commitment import Confirmed
 from solders.transaction import VersionedTransaction
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-import anthropic
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 WALLET_PRIVKEY = os.getenv("WALLET_PRIVATE_KEY", "")
 YOUR_CHAT_ID   = int(os.getenv("YOUR_CHAT_ID", "0"))
 
@@ -161,10 +159,9 @@ def safety_check(usd):
     return True, "ok"
 
 async def chat_with_claude(user_message):
-    if not CLAUDE_API_KEY:
-        return "أضف CLAUDE_API_KEY في Railway"
+    if not GROQ_API_KEY:
+        return "أضف GROQ_API_KEY في Railway"
     try:
-        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
         pump_status = "مفعّل" if state["pump_enabled"] else "معطّل"
         system = f"""أنت مساعد بوت تداول سولانا ذكي واسمك سولانا بوت. تتحدث بالعربية بشكل طبيعي وودود كأنك صديق خبير في التداول.
 
@@ -188,15 +185,20 @@ async def chat_with_claude(user_message):
         if len(state["chat_history"]) > 20:
             state["chat_history"] = state["chat_history"][-20:]
 
-        resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=600,
-            system=system,
-            messages=state["chat_history"]
-        )
-        reply = resp.content[0].text
-        state["chat_history"].append({"role": "assistant", "content": reply})
-        return reply
+        messages = [{"role": "system", "content": system}] + state["chat_history"]
+
+        async with httpx.AsyncClient(timeout=30) as h:
+            r = await h.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 600}
+            )
+            if r.status_code == 200:
+                reply = r.json()["choices"][0]["message"]["content"]
+                state["chat_history"].append({"role": "assistant", "content": reply})
+                return reply
+            else:
+                return f"خطأ Groq: {r.status_code}"
     except Exception as e:
         return f"خطأ: {str(e)[:80]}"
 
