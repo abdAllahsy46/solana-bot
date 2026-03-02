@@ -361,23 +361,30 @@ async def handle_message(update, ctx):
 
 async def trading_loop(app):
     """
-    استراتيجية تداول SOL نشطة:
-    - يجمع 12 قراءة سعر كل 30 ثانية (6 دقائق إجمالاً)
-    - يحسب المتوسط المتحرك القصير والطويل
-    - يشتري عند تقاطع المتوسطات صعوداً
-    - يبيع عند تحقيق الهدف أو الوقف
+    🎯 استراتيجية القناص:
+    - يراقب السعر كل 15 ثانية
+    - ينتظر انخفاض حاد ثم ارتداد = نقطة دخول مثالية
+    - هدف الربح: +10% | وقف الخسارة: -5%
+    - صبور في الدخول، سريع في الخروج
     """
     owner = state["owner_chat_id"]
-    prices = []  # سجل الأسعار
+    prices = []
     in_pos = False
     entry = 0.0
     amt_sol = 0.0
+    lowest_price = 0.0  # أدنى سعر قبل الارتداد
 
-    log.info("🚀 حلقة التداول SOL بدأت")
-    await app.bot.send_message(owner, "🟡 *البوت يراقب سعر SOL الآن...*\nسيشتري عند أول فرصة مناسبة!", parse_mode="Markdown")
+    log.info("🎯 القناص بدأ المراقبة")
+    await app.bot.send_message(owner, """🎯 *القناص جاهز للصيد!*
+━━━━━━━━━━━━━━━
+🔍 يراقب سعر SOL كل 15 ثانية
+⏳ ينتظر فرصة مثالية للدخول
+🎯 هدف: *+10%* | 🛑 وقف: *-5%*
+━━━━━━━━━━━━━━━
+الصبر مفتاح النجاح! 🧘""", parse_mode="Markdown")
 
     while state["running"]:
-        await asyncio.sleep(30)  # كل 30 ثانية
+        await asyncio.sleep(15)  # كل 15 ثانية
         if not state["running"]: break
         try:
             price = await get_sol_price()
@@ -385,23 +392,40 @@ async def trading_loop(app):
             state["current_balance_sol"] = sol
             prices.append(price)
 
-            # احتفظ بآخر 20 قراءة فقط
-            if len(prices) > 20:
+            if len(prices) > 40:
                 prices.pop(0)
 
-            if len(prices) < 6:
-                continue  # انتظر حتى تتجمع بيانات كافية
+            if len(prices) < 10:
+                continue
 
-            # المتوسط المتحرك القصير (3 قراءات) والطويل (6 قراءات)
-            ma_short = sum(prices[-3:]) / 3
-            ma_long = sum(prices[-6:]) / 6
-            chg_1min = ((price - prices[-3]) / prices[-3]) * 100 if len(prices) >= 3 else 0
+            # حسابات القناص
+            ma5  = sum(prices[-5:]) / 5    # متوسط 5 قراءات (75 ثانية)
+            ma10 = sum(prices[-10:]) / 10  # متوسط 10 قراءات (150 ثانية)
+            ma20 = sum(prices[-20:]) / 20 if len(prices) >= 20 else ma10
 
-            log.info(f"SOL: ${price:.2f} | MA3: ${ma_short:.2f} | MA6: ${ma_long:.2f} | تغير: {chg_1min:+.2f}%")
+            # أعلى وأدنى سعر في آخر 20 قراءة
+            recent_high = max(prices[-20:]) if len(prices) >= 20 else max(prices)
+            recent_low  = min(prices[-20:]) if len(prices) >= 20 else min(prices)
+
+            # نسبة الانخفاض من القمة
+            drop_from_high = ((price - recent_high) / recent_high) * 100
+            # نسبة الارتداد من القاع
+            bounce_from_low = ((price - recent_low) / recent_low) * 100
+
+            log.info(f"SOL: ${price:.2f} | MA5: ${ma5:.2f} | انخفاض: {drop_from_high:.2f}% | ارتداد: {bounce_from_low:.2f}%")
 
             if not in_pos:
-                # شرط الشراء: MA القصير فوق MA الطويل + ارتفاع خلال دقيقة
-                if ma_short > ma_long and chg_1min >= 0.2:
+                # ✅ شروط دخول القناص:
+                # 1. السعر انخفض على الأقل 2% من القمة الأخيرة
+                # 2. بدأ يرتد للأعلى (ارتداد 0.5% على الأقل من القاع)
+                # 3. MA5 بدأ يتجاوز MA10 (إشارة صعود)
+                sniper_entry = (
+                    drop_from_high <= -2.0 and
+                    bounce_from_low >= 0.5 and
+                    ma5 >= ma10
+                )
+
+                if sniper_entry:
                     usd = state["max_trade_usd"]
                     ok, reason = safety_check(usd)
                     if not ok:
@@ -413,32 +437,42 @@ async def trading_loop(app):
                     if q:
                         sig = await do_swap(q)
                         if sig:
-                            in_pos = True; entry = price; amt_sol = sol_amt
+                            in_pos = True
+                            entry = price
+                            amt_sol = sol_amt
+                            lowest_price = recent_low
                             state["total_trades"] += 1
-                            await app.bot.send_message(owner, f"""🟢 *شراء SOL!*
-━━━━━━━━━━━━━━━
+
+                            await app.bot.send_message(owner, f"""🎯 *القناص أطلق النار!*
+━━━━━━━━━━━━━━━━━━
+🪙 SOL/USDC
 💵 سعر الدخول: `${price:.2f}`
 📦 الكمية: `{sol_amt:.4f} SOL` (≈ `${usd:.2f}`)
-📈 MA قصير: `${ma_short:.2f}` > MA طويل: `${ma_long:.2f}`
-━━━━━━━━━━━━━━━
-🎯 هدف: `${price*1.015:.2f}` (+1.5%)
-🛑 وقف: `${price*0.99:.2f}` (-1%)
+━━━━━━━━━━━━━━━━━━
+📉 انخفض: `{drop_from_high:.1f}%` من القمة
+📈 ارتد: `{bounce_from_low:.1f}%` من القاع
+━━━━━━━━━━━━━━━━━━
+🎯 هدف الربح: `${price*1.10:.2f}` (+10%)
+🛑 وقف الخسارة: `${price*0.95:.2f}` (-5%)
 🔗 [Solscan](https://solscan.io/tx/{sig})""", parse_mode="Markdown")
                         else:
-                            log.warning("فشل تنفيذ الصفقة")
+                            await app.bot.send_message(owner, "⚠️ فرصة رصدها القناص لكن فشل التنفيذ - سيحاول مجدداً")
 
             else:
                 pct = ((price - entry) / entry) * 100
 
-                # هدف الربح 1.5% أو وقف خسارة 1%
-                if pct >= 1.5:
-                    should_sell = True; sell_reason = "🎯 تحقق هدف +1.5%"
-                elif pct <= -1.0:
-                    should_sell = True; sell_reason = "🛑 وقف الخسارة -1%"
-                elif ma_short < ma_long and pct > 0:
-                    should_sell = True; sell_reason = "📉 انعكاس الاتجاه"
+                if pct >= 10.0:
+                    should_sell = True
+                    sell_reason = "🎯 هدف +10% تحقق!"
+                elif pct <= -5.0:
+                    should_sell = True
+                    sell_reason = "🛑 وقف الخسارة -5%"
+                elif pct >= 5.0 and ma5 < ma10:
+                    should_sell = True
+                    sell_reason = "📉 انعكاس الاتجاه عند +5%"
                 else:
-                    should_sell = False; sell_reason = ""
+                    should_sell = False
+                    sell_reason = ""
 
                 if should_sell:
                     q = await get_quote(USDC_MINT, SOL_MINT, int(amt_sol * price * 1_000_000))
@@ -446,22 +480,30 @@ async def trading_loop(app):
                         sig = await do_swap(q)
                         if sig:
                             pnl = amt_sol * (price - entry)
-                            state["win" if pnl > 0 else "lose"] += 1
+                            is_win = pnl > 0
+                            state["win" if is_win else "lose"] += 1
                             state["daily_profit_usd"] += pnl
-                            if pnl < 0: state["daily_loss_today"] += abs(pnl)
+                            if not is_win:
+                                state["daily_loss_today"] += abs(pnl)
                             in_pos = False
-                            icon = "✅" if pnl > 0 else "❌"
-                            await app.bot.send_message(owner, f"""{icon} *بيع SOL - {sell_reason}*
-━━━━━━━━━━━━━━━
-💵 دخول: `${entry:.2f}` ← خروج: `${price:.2f}`
+                            icon = "✅" if is_win else "❌"
+
+                            await app.bot.send_message(owner, f"""{icon} *القناص أغلق الصفقة*
+━━━━━━━━━━━━━━━━━━
+{sell_reason}
+💵 دخول: `${entry:.2f}` → خروج: `${price:.2f}`
 📊 النتيجة: `{pct:+.2f}%`
 💰 الربح/الخسارة: `${pnl:+.2f}`
-━━━━━━━━━━━━━━━
-💵 أرباح اليوم: `${state['daily_profit_usd']:+.2f}`
+━━━━━━━━━━━━━━━━━━
+📈 أرباح اليوم: `${state['daily_profit_usd']:+.2f}`
+✅ `{state['win']}` ❌ `{state['lose']}`
 🔗 [Solscan](https://solscan.io/tx/{sig})""", parse_mode="Markdown")
 
+                            # انتظر قليلاً قبل الصفقة التالية
+                            await asyncio.sleep(60)
+
         except Exception as e:
-            log.error(f"خطأ التداول: {e}")
+            log.error(f"خطأ القناص: {e}")
             await asyncio.sleep(30)
 
 async def pump_loop(app):
