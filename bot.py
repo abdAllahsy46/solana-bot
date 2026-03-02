@@ -1,38 +1,39 @@
 import os, asyncio, logging, httpx, base58, re, json
 from datetime import datetime, time as dtime
 from solders.keypair import Keypair
-from solders.pubkey import Pubkey
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed
 from solders.transaction import VersionedTransaction
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 WALLET_PRIVKEY = os.getenv("WALLET_PRIVATE_KEY", "")
 YOUR_CHAT_ID   = int(os.getenv("YOUR_CHAT_ID", "0"))
 
-SOL_MINT  = "So11111111111111111111111111111111111111112"
-USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-RPC_URL   = "https://api.mainnet-beta.solana.com"
+SOL_MINT = "So11111111111111111111111111111111111111112"
+RPC_URL  = "https://api.mainnet-beta.solana.com"
 
 state = {
     "running": False,
-    "pump_enabled": True,
     "total_trades": 0,
     "daily_profit_usd": 0.0,
     "win": 0, "lose": 0,
     "start_balance_sol": 0.0,
     "current_balance_sol": 0.0,
-    "max_trade_usd": float(os.getenv("MAX_TRADE_USD", "2")),
-    "stop_loss_pct": float(os.getenv("STOP_LOSS_PCT", "10")),
-    "daily_loss_limit_usd": float(os.getenv("DAILY_LOSS_LIMIT", "5")),
+    "trade_sol": float(os.getenv("TRADE_SOL", "0.01")),       # كمية SOL لكل صفقة
+    "take_profit": 50.0,                                        # هدف الربح 50%
+    "stop_loss": 30.0,                                          # وقف الخسارة 30%
+    "max_hold_minutes": 30,                                     # أقصى وقت للاحتفاظ بالتوكن
+    "max_active": 3,                                            # أقصى عدد توكنات في نفس الوقت
+    "daily_loss_limit_sol": float(os.getenv("DAILY_LOSS_LIMIT", "0.05")),
     "daily_loss_today": 0.0,
     "owner_chat_id": YOUR_CHAT_ID,
     "last_sol_price": 0.0,
     "chat_history": [],
-    "active_pump_tokens": [],
-    "pump_min_liquidity": 5000,
+    "positions": {},   # mint -> {buy_price, sol_spent, buy_time, name, symbol, amount}
+    "seen_tokens": set(),
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -64,156 +65,145 @@ async def get_sol_price():
             return p
     except: return state["last_sol_price"] or 150.0
 
-async def get_pump_new_tokens():
+async def get_new_pump_tokens():
+    """جلب التوكنات الجديدة من Pump.fun"""
     try:
         async with httpx.AsyncClient(timeout=15) as h:
             r = await h.get("https://frontend-api.pump.fun/coins",
-                           params={"limit": 20, "sort": "created_timestamp", "order": "DESC", "includeNsfw": False})
+                           params={"limit": 50, "sort": "created_timestamp",
+                                   "order": "DESC", "includeNsfw": False})
             if r.status_code == 200:
                 return r.json()
     except Exception as e:
-        log.error(f"خطأ Pump.fun: {e}")
+        log.error(f"Pump.fun error: {e}")
     return []
 
-async def filter_pump_tokens(tokens):
-    good = []
-    for t in tokens:
-        try:
-            usd_mc = t.get("usd_market_cap", 0)
-            created = t.get("created_timestamp", 0)
-            age_minutes = (datetime.now().timestamp() * 1000 - created) / 60000
-            if usd_mc < state["pump_min_liquidity"]: continue
-            if usd_mc > 500000: continue
-            if age_minutes > 60: continue
-            if age_minutes < 2: continue
-            if t.get("complete", False): continue
-            good.append({"mint": t.get("mint"), "name": t.get("name", "Unknown"),
-                         "symbol": t.get("symbol", "???"), "market_cap": usd_mc,
-                         "age_min": round(age_minutes, 1)})
-        except: continue
-    return good
-
-async def buy_pump_token(mint, sol_amount):
-    if not keypair: return None
+async def get_token_price_sol(mint):
+    """سعر التوكن بالـ SOL عبر Jupiter"""
     try:
-        lamports = int(sol_amount * 1_000_000_000)
-        async with httpx.AsyncClient(timeout=15) as h:
-            r = await h.get("https://quote-api.jup.ag/v6/quote",
-                           params={"inputMint": SOL_MINT, "outputMint": mint,
-                                   "amount": lamports, "slippageBps": 1000})
-            if r.status_code != 200: return None
-            swap = await h.post("https://quote-api.jup.ag/v6/swap", json={
-                "quoteResponse": r.json(),
-                "userPublicKey": str(keypair.pubkey()),
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": 5000,
-            })
-            if swap.status_code != 200: return None
-            tx = VersionedTransaction.from_bytes(base58.b58decode(swap.json()["swapTransaction"]))
-            tx.sign([keypair])
-            async with AsyncClient(RPC_URL) as client:
-                res = await client.send_raw_transaction(bytes(tx),
-                    opts={"skip_preflight": False, "preflight_commitment": "confirmed"})
-                return str(res.value)
-    except Exception as e:
-        log.error(f"خطأ شراء Pump: {e}")
-        return None
-
-async def get_quote(inp, out, amt):
-    try:
-        async with httpx.AsyncClient(timeout=15) as h:
-            r = await h.get("https://quote-api.jup.ag/v6/quote",
-                           params={"inputMint": inp, "outputMint": out, "amount": amt, "slippageBps": 50})
-            if r.status_code == 200: return r.json()
+        async with httpx.AsyncClient(timeout=10) as h:
+            r = await h.get("https://price.jup.ag/v6/price",
+                           params={"ids": mint, "vsToken": SOL_MINT})
+            if r.status_code == 200:
+                data = r.json().get("data", {})
+                if mint in data:
+                    return float(data[mint]["price"])
     except: pass
     return None
 
-async def do_swap(quote):
-    if not keypair: return None
+async def buy_token(mint, sol_amount):
+    """شراء توكن بكمية SOL محددة"""
+    if not keypair: return None, 0
     try:
-        async with httpx.AsyncClient(timeout=30) as h:
-            r = await h.post("https://quote-api.jup.ag/v6/swap", json={
+        lamports = int(sol_amount * 1_000_000_000)
+        async with httpx.AsyncClient(timeout=20) as h:
+            # جلب الـ quote
+            r = await h.get("https://quote-api.jup.ag/v6/quote",
+                           params={"inputMint": SOL_MINT, "outputMint": mint,
+                                   "amount": lamports, "slippageBps": 2000})
+            if r.status_code != 200: return None, 0
+            quote = r.json()
+            out_amount = int(quote.get("outAmount", 0))
+
+            # تنفيذ الصفقة
+            swap = await h.post("https://quote-api.jup.ag/v6/swap", json={
                 "quoteResponse": quote,
                 "userPublicKey": str(keypair.pubkey()),
                 "wrapAndUnwrapSol": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": 1000,
+                "prioritizationFeeLamports": 10000,
             })
-            if r.status_code != 200: return None
-            tx = VersionedTransaction.from_bytes(base58.b58decode(r.json()["swapTransaction"]))
+            if swap.status_code != 200: return None, 0
+
+            tx = VersionedTransaction.from_bytes(base58.b58decode(swap.json()["swapTransaction"]))
             tx.sign([keypair])
             async with AsyncClient(RPC_URL) as c:
                 res = await c.send_raw_transaction(bytes(tx),
-                    opts={"skip_preflight": False, "preflight_commitment": "confirmed"})
+                    opts={"skip_preflight": True, "preflight_commitment": "confirmed"})
+                return str(res.value), out_amount
+    except Exception as e:
+        log.error(f"خطأ الشراء: {e}")
+        return None, 0
+
+async def sell_token(mint, token_amount):
+    """بيع كل التوكنات"""
+    if not keypair: return None
+    try:
+        async with httpx.AsyncClient(timeout=20) as h:
+            r = await h.get("https://quote-api.jup.ag/v6/quote",
+                           params={"inputMint": mint, "outputMint": SOL_MINT,
+                                   "amount": token_amount, "slippageBps": 2500})
+            if r.status_code != 200: return None
+            quote = r.json()
+
+            swap = await h.post("https://quote-api.jup.ag/v6/swap", json={
+                "quoteResponse": quote,
+                "userPublicKey": str(keypair.pubkey()),
+                "wrapAndUnwrapSol": True,
+                "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": 10000,
+            })
+            if swap.status_code != 200: return None
+
+            tx = VersionedTransaction.from_bytes(base58.b58decode(swap.json()["swapTransaction"]))
+            tx.sign([keypair])
+            async with AsyncClient(RPC_URL) as c:
+                res = await c.send_raw_transaction(bytes(tx),
+                    opts={"skip_preflight": True, "preflight_commitment": "confirmed"})
                 return str(res.value)
     except Exception as e:
-        log.error(f"swap error: {e}")
+        log.error(f"خطأ البيع: {e}")
         return None
 
-def safety_check(usd):
-    if usd > state["max_trade_usd"]: return False, f"تجاوز الحد ${state['max_trade_usd']}"
-    if state["daily_loss_today"] >= state["daily_loss_limit_usd"]: return False, "تجاوز حد الخسارة اليومية"
-    sol_price = state["last_sol_price"] or 150
-    if state["current_balance_sol"] < (usd / sol_price) + 0.01: return False, "رصيد غير كافٍ"
-    return True, "ok"
-
-async def chat_with_claude(user_message):
+async def chat_with_ai(user_message):
     if not GROQ_API_KEY:
         return "أضف GROQ_API_KEY في Railway"
     try:
-        pump_status = "مفعّل" if state["pump_enabled"] else "معطّل"
-        system = f"""أنت مساعد بوت تداول سولانا ذكي واسمك سولانا بوت. تتحدث بالعربية بشكل طبيعي وودود كأنك صديق خبير في التداول.
+        positions_count = len(state["positions"])
+        system = f"""أنت مساعد بوت تداول سولانا ذكي. تتحدث بالعربية بشكل طبيعي وودود.
 
 حالتك الآن:
 - التشغيل: {'يعمل' if state['running'] else 'متوقف'}
-- الرصيد: {state['current_balance_sol']:.4f} SOL (حوالي ${state['current_balance_sol'] * (state['last_sol_price'] or 150):.2f})
+- الرصيد: {state['current_balance_sol']:.4f} SOL
 - سعر SOL: ${state['last_sol_price']:.2f}
-- Pump.fun: {pump_status} | توكنات نشطة: {len(state['active_pump_tokens'])}
+- توكنات مفتوحة: {positions_count}
 - صفقات اليوم: {state['total_trades']} | نجاح: {state['win']} | خسارة: {state['lose']}
 - أرباح اليوم: ${state['daily_profit_usd']:+.2f}
-- حد الصفقة: ${state['max_trade_usd']}
+- كمية الصفقة: {state['trade_sol']} SOL
+- هدف الربح: {state['take_profit']}% | وقف الخسارة: {state['stop_loss']}%
 
-تعليماتك:
-- أجب بشكل طبيعي وودود مثل محادثة حقيقية
-- إذا سألك عن التداول أو السوق قدم تحليلاً مفيداً
-- إذا سألك عن البوت أخبره بحالته الحقيقية
-- لا تكن رسمياً جداً كن ودوداً ومفيداً
-- يمكنك الإجابة على أي سؤال عام أيضاً"""
+أجب بشكل طبيعي وودود وقصير."""
 
         state["chat_history"].append({"role": "user", "content": user_message})
-        if len(state["chat_history"]) > 20:
-            state["chat_history"] = state["chat_history"][-20:]
-
-        messages = [{"role": "system", "content": system}] + state["chat_history"]
+        if len(state["chat_history"]) > 16:
+            state["chat_history"] = state["chat_history"][-16:]
 
         async with httpx.AsyncClient(timeout=30) as h:
             r = await h.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 600}
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={"model": "llama-3.3-70b-versatile",
+                      "messages": [{"role": "system", "content": system}] + state["chat_history"],
+                      "max_tokens": 400}
             )
             if r.status_code == 200:
                 reply = r.json()["choices"][0]["message"]["content"]
                 state["chat_history"].append({"role": "assistant", "content": reply})
                 return reply
-            else:
-                return f"خطأ Groq: {r.status_code}"
     except Exception as e:
-        return f"خطأ: {str(e)[:80]}"
+        return f"خطأ: {str(e)[:60]}"
 
 def kb():
     lbl = "⏸ إيقاف" if state["running"] else "▶️ تشغيل"
-    pump_lbl = "🚀 Pump: ON" if state["pump_enabled"] else "🚀 Pump: OFF"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(lbl, callback_data="toggle"),
          InlineKeyboardButton("📊 الحالة", callback_data="status")],
-        [InlineKeyboardButton("📈 التقرير", callback_data="report"),
-         InlineKeyboardButton("💰 الرصيد", callback_data="balance")],
-        [InlineKeyboardButton("🧠 تحليل السوق", callback_data="analyze"),
+        [InlineKeyboardButton("💰 الرصيد", callback_data="balance"),
+         InlineKeyboardButton("📈 التقرير", callback_data="report")],
+        [InlineKeyboardButton("🎯 المراكز", callback_data="positions"),
          InlineKeyboardButton("⚙️ إعدادات", callback_data="settings")],
-        [InlineKeyboardButton(pump_lbl, callback_data="toggle_pump"),
-         InlineKeyboardButton("🎯 توكنات Pump", callback_data="pump_tokens")],
+        [InlineKeyboardButton("🧠 تحليل", callback_data="analyze"),
+         InlineKeyboardButton("🚨 بيع الكل", callback_data="sell_all")],
     ])
 
 def wr():
@@ -228,40 +218,20 @@ async def cmd_start(update, ctx):
     state["current_balance_sol"] = sol
     state["start_balance_sol"] = sol
     w = str(keypair.pubkey())[:8] + "..." if keypair else "غير محمّلة"
-    await update.message.reply_text(f"""🤖 *بوت سولانا المتقدم*
+    await update.message.reply_text(f"""🚀 *بوت Pump.fun القناص*
 ━━━━━━━━━━━━━━━━━━━━
 🔑 المحفظة: `{w}`
 💰 الرصيد: `{sol:.4f} SOL` (≈ `${sol*price:.2f}`)
 📈 سعر SOL: `${price:.2f}`
 ━━━━━━━━━━━━━━━━━━━━
-🚀 Pump.fun: `مفعّل ✅`
-🛡 حد الصفقة: `${state['max_trade_usd']}`
-🛑 خسارة يومية: `${state['daily_loss_limit_usd']}`
+⚡ يشتري كل توكن جديد على Pump.fun
+🎯 هدف: *+{state['take_profit']}%* | 🛑 وقف: *-{state['stop_loss']}%*
+💸 حجم الصفقة: `{state['trade_sol']} SOL`
 ━━━━━━━━━━━━━━━━━━━━
 📌 معرفك: `{cid}`
-
 💬 يمكنك الكلام معي بشكل طبيعي!
-اضغط تشغيل للبدء 👇""", parse_mode="Markdown", reply_markup=kb())
 
-async def cmd_status(update, ctx):
-    sol = await get_balance_sol()
-    price = await get_sol_price()
-    state["current_balance_sol"] = sol
-    pnl = (sol - state["start_balance_sol"]) * price
-    msg = update.message or update.callback_query.message
-    await msg.reply_text(f"""📊 *الحالة الكاملة*
-━━━━━━━━━━━━━━━━━━━━
-🤖 {'🟢 يعمل' if state['running'] else '🔴 متوقف'}
-🚀 Pump.fun: {'✅ مفعّل' if state['pump_enabled'] else '❌ معطّل'}
-💰 `{sol:.4f} SOL` (≈ `${sol*price:.2f}`)
-📈 SOL: `${price:.2f}`
-━━━━━━━━━━━━━━━━━━━━
-🔄 الصفقات: `{state['total_trades']}`
-✅ `{state['win']}` ❌ `{state['lose']}` 🎯 `{wr()}%`
-💵 اليوم: `${state['daily_profit_usd']:+.2f}`
-📊 الكلي: `${pnl:+.2f}`
-🎪 توكنات Pump: `{len(state['active_pump_tokens'])}`""",
-        parse_mode="Markdown", reply_markup=kb())
+اضغط تشغيل للبدء 👇""", parse_mode="Markdown", reply_markup=kb())
 
 async def handle_buttons(update, ctx):
     q = update.callback_query
@@ -270,29 +240,27 @@ async def handle_buttons(update, ctx):
     if q.data == "toggle":
         state["running"] = not state["running"]
         if state["running"]:
-            asyncio.create_task(trading_loop(ctx.application))
-            if state["pump_enabled"]:
-                asyncio.create_task(pump_loop(ctx.application))
-        await q.edit_message_text(
-            "✅ البوت يعمل! يبحث عن فرص كل 5 دقائق 🚀" if state["running"] else "⛔ البوت متوقف.",
-            reply_markup=kb())
-
-    elif q.data == "toggle_pump":
-        state["pump_enabled"] = not state["pump_enabled"]
-        status = "مفعّل ✅" if state["pump_enabled"] else "معطّل ❌"
-        await q.edit_message_text(f"🚀 Pump.fun {status}", reply_markup=kb())
-
-    elif q.data == "pump_tokens":
-        if not state["active_pump_tokens"]:
-            await q.edit_message_text("🎯 لا توجد توكنات Pump.fun نشطة.", reply_markup=kb())
-        else:
-            txt = "🎯 *توكنات Pump.fun النشطة:*\n━━━━━━━━━━\n"
-            for t in state["active_pump_tokens"]:
-                txt += f"🪙 `{t['symbol']}` | SOL: `{t['sol_spent']:.4f}`\n"
-            await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb())
+            asyncio.create_task(pump_sniper_loop(ctx.application))
+            asyncio.create_task(monitor_positions(ctx.application))
+        txt = "✅ *القناص يعمل!*\nيراقب Pump.fun ويشتري كل توكن جديد 🎯" if state["running"] else "⛔ البوت متوقف."
+        await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb())
 
     elif q.data == "status":
-        await cmd_status(update, ctx)
+        sol = await get_balance_sol()
+        price = await get_sol_price()
+        state["current_balance_sol"] = sol
+        pnl = (sol - state["start_balance_sol"]) * price
+        await q.edit_message_text(f"""📊 *الحالة*
+━━━━━━━━━━━━━━━
+🤖 {'🟢 يعمل' if state['running'] else '🔴 متوقف'}
+💰 `{sol:.4f} SOL` (≈ `${sol*price:.2f}`)
+🎯 مراكز مفتوحة: `{len(state['positions'])}`
+━━━━━━━━━━━━━━━
+🔄 الصفقات: `{state['total_trades']}`
+✅ `{state['win']}` ❌ `{state['lose']}` 🎯 `{wr()}%`
+💵 اليوم: `${state['daily_profit_usd']:+.2f}`
+📊 الكلي: `${pnl:+.2f}`""",
+            parse_mode="Markdown", reply_markup=kb())
 
     elif q.data == "balance":
         sol = await get_balance_sol()
@@ -306,29 +274,56 @@ async def handle_buttons(update, ctx):
 ━━━━━━━━━━━━━━━
 🔄 `{state['total_trades']}` صفقة
 ✅ `{state['win']}` | ❌ `{state['lose']}` | 🎯 `{wr()}%`
-💵 `${state['daily_profit_usd']:+.2f}`
-🛑 خسائر: `${state['daily_loss_today']:.2f}` / `${state['daily_loss_limit_usd']}`""",
+💵 `${state['daily_profit_usd']:+.2f}`""",
             parse_mode="Markdown", reply_markup=kb())
 
-    elif q.data == "analyze":
-        await q.edit_message_text("🧠 أحلل السوق...", reply_markup=kb())
-        txt = await chat_with_claude("حلل سوق سولانا الآن وأعطني توصية، وهل يجب البحث في Pump.fun؟")
-        await q.edit_message_text(f"🧠 *تحليل:*\n\n{txt}", parse_mode="Markdown", reply_markup=kb())
+    elif q.data == "positions":
+        if not state["positions"]:
+            await q.edit_message_text("🎯 لا توجد مراكز مفتوحة حالياً.", reply_markup=kb())
+        else:
+            txt = "🎯 *المراكز المفتوحة:*\n━━━━━━━━━━\n"
+            for mint, pos in state["positions"].items():
+                age = (datetime.now().timestamp() - pos["buy_time"]) / 60
+                current_price = await get_token_price_sol(mint)
+                if current_price and pos["buy_price"] > 0:
+                    pct = ((current_price - pos["buy_price"]) / pos["buy_price"]) * 100
+                    txt += f"🪙 `{pos['symbol']}` | `{pct:+.1f}%` | ⏰ `{age:.0f}` دقيقة\n"
+                else:
+                    txt += f"🪙 `{pos['symbol']}` | ⏰ `{age:.0f}` دقيقة\n"
+            await q.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb())
 
     elif q.data == "settings":
         await q.edit_message_text(f"""⚙️ *الإعدادات*
 ━━━━━━━━━━━━━━━
-💵 حد الصفقة: `${state['max_trade_usd']}`
-📉 Stop Loss: `{state['stop_loss_pct']}%`
-🛑 خسارة يومية: `${state['daily_loss_limit_usd']}`
-🚀 Pump.fun: `{'مفعّل' if state['pump_enabled'] else 'معطّل'}`
-💧 حد سيولة Pump: `${state['pump_min_liquidity']}`
+💸 حجم الصفقة: `{state['trade_sol']} SOL`
+🎯 هدف الربح: `{state['take_profit']}%`
+🛑 وقف الخسارة: `{state['stop_loss']}%`
+⏰ أقصى وقت: `{state['max_hold_minutes']} دقيقة`
+📦 أقصى مراكز: `{state['max_active']}`
 ━━━━━━━━━━━━━━━
 *للتغيير اكتب مثلاً:*
-_"غير حد الصفقة إلى 3"_
-_"غير stop loss إلى 15"_
-_"غير الخسارة اليومية إلى 8"_""",
+_"غير حجم الصفقة إلى 0.02"_
+_"غير الهدف إلى 100"_
+_"غير الوقف إلى 20"_""",
             parse_mode="Markdown", reply_markup=kb())
+
+    elif q.data == "analyze":
+        await q.edit_message_text("🧠 أفكر...", reply_markup=kb())
+        txt = await chat_with_ai("حلل السوق الآن وأعطني رأيك في استراتيجية شراء كل توكن جديد على Pump.fun")
+        await q.edit_message_text(f"🧠 {txt}", parse_mode="Markdown", reply_markup=kb())
+
+    elif q.data == "sell_all":
+        if not state["positions"]:
+            await q.edit_message_text("لا توجد مراكز مفتوحة.", reply_markup=kb())
+            return
+        await q.edit_message_text("🚨 *جاري بيع كل المراكز...*", parse_mode="Markdown", reply_markup=kb())
+        for mint in list(state["positions"].keys()):
+            pos = state["positions"][mint]
+            if pos.get("amount", 0) > 0:
+                sig = await sell_token(mint, pos["amount"])
+                if sig:
+                    del state["positions"][mint]
+        await q.edit_message_text("✅ تم بيع كل المراكز.", reply_markup=kb())
 
 async def handle_message(update, ctx):
     txt = update.message.text.strip()
@@ -337,266 +332,217 @@ async def handle_message(update, ctx):
         state["running"] = False
         await update.message.reply_text("⛔ تم الإيقاف.", reply_markup=kb()); return
 
-    if any(w in txt for w in ["شغل", "تشغيل", "ابدأ", "شغّل"]):
+    if any(w in txt for w in ["شغل", "تشغيل", "ابدأ"]):
         state["running"] = True
-        asyncio.create_task(trading_loop(ctx.application))
-        if state["pump_enabled"]:
-            asyncio.create_task(pump_loop(ctx.application))
-        await update.message.reply_text("✅ البوت يعمل!", reply_markup=kb()); return
+        asyncio.create_task(pump_sniper_loop(ctx.application))
+        asyncio.create_task(monitor_positions(ctx.application))
+        await update.message.reply_text("✅ القناص يعمل! 🎯", reply_markup=kb()); return
 
     nums = re.findall(r'\d+\.?\d*', txt)
-    if "حد الصفقة" in txt and nums:
-        state["max_trade_usd"] = float(nums[0])
-        await update.message.reply_text(f"✅ حد الصفقة = ${nums[0]}", reply_markup=kb()); return
-    if ("stop loss" in txt.lower() or "ستوب" in txt) and nums:
-        state["stop_loss_pct"] = float(nums[0])
-        await update.message.reply_text(f"✅ Stop Loss = {nums[0]}%", reply_markup=kb()); return
-    if "خسارة يومية" in txt and nums:
-        state["daily_loss_limit_usd"] = float(nums[0])
-        await update.message.reply_text(f"✅ الخسارة اليومية = ${nums[0]}", reply_markup=kb()); return
+    if "حجم الصفقة" in txt and nums:
+        state["trade_sol"] = float(nums[0])
+        await update.message.reply_text(f"✅ حجم الصفقة = {nums[0]} SOL", reply_markup=kb()); return
+    if "الهدف" in txt and nums:
+        state["take_profit"] = float(nums[0])
+        await update.message.reply_text(f"✅ هدف الربح = {nums[0]}%", reply_markup=kb()); return
+    if "الوقف" in txt and nums:
+        state["stop_loss"] = float(nums[0])
+        await update.message.reply_text(f"✅ وقف الخسارة = {nums[0]}%", reply_markup=kb()); return
+    if "الوقت" in txt and nums:
+        state["max_hold_minutes"] = int(float(nums[0]))
+        await update.message.reply_text(f"✅ أقصى وقت = {nums[0]} دقيقة", reply_markup=kb()); return
 
     thinking = await update.message.reply_text("💬 أفكر...")
-    reply = await chat_with_claude(txt)
+    reply = await chat_with_ai(txt)
     await thinking.edit_text(f"🤖 {reply}", reply_markup=kb())
 
-async def trading_loop(app):
-    """
-    🎯 استراتيجية القناص:
-    - يراقب السعر كل 15 ثانية
-    - ينتظر انخفاض حاد ثم ارتداد = نقطة دخول مثالية
-    - هدف الربح: +10% | وقف الخسارة: -5%
-    - صبور في الدخول، سريع في الخروج
-    """
+async def pump_sniper_loop(app):
+    """حلقة اصطياد توكنات Pump.fun الجديدة"""
     owner = state["owner_chat_id"]
-    prices = []
-    in_pos = False
-    entry = 0.0
-    amt_sol = 0.0
-    lowest_price = 0.0  # أدنى سعر قبل الارتداد
-
-    log.info("🎯 القناص بدأ المراقبة")
-    await app.bot.send_message(owner, """🎯 *القناص جاهز للصيد!*
-━━━━━━━━━━━━━━━
-🔍 يراقب سعر SOL كل 15 ثانية
-⏳ ينتظر فرصة مثالية للدخول
-🎯 هدف: *+10%* | 🛑 وقف: *-5%*
-━━━━━━━━━━━━━━━
-الصبر مفتاح النجاح! 🧘""", parse_mode="Markdown")
+    log.info("🎯 Pump Sniper بدأ")
+    await app.bot.send_message(owner, "🎯 *القناص يراقب Pump.fun الآن!*\nسيشتري كل توكن جديد تلقائياً.", parse_mode="Markdown")
 
     while state["running"]:
-        await asyncio.sleep(15)  # كل 15 ثانية
+        await asyncio.sleep(30)  # فحص كل 30 ثانية
         if not state["running"]: break
         try:
-            price = await get_sol_price()
-            sol = await get_balance_sol()
-            state["current_balance_sol"] = sol
-            prices.append(price)
+            sol_price = await get_sol_price()
+            sol_bal = await get_balance_sol()
+            state["current_balance_sol"] = sol_bal
 
-            if len(prices) > 40:
-                prices.pop(0)
-
-            if len(prices) < 10:
+            # تحقق من الرصيد
+            if sol_bal < state["trade_sol"] + 0.005:
+                log.warning(f"رصيد غير كافٍ: {sol_bal:.4f} SOL")
                 continue
 
-            # حسابات القناص
-            ma5  = sum(prices[-5:]) / 5    # متوسط 5 قراءات (75 ثانية)
-            ma10 = sum(prices[-10:]) / 10  # متوسط 10 قراءات (150 ثانية)
-            ma20 = sum(prices[-20:]) / 20 if len(prices) >= 20 else ma10
+            # تحقق من عدد المراكز
+            if len(state["positions"]) >= state["max_active"]:
+                continue
 
-            # أعلى وأدنى سعر في آخر 20 قراءة
-            recent_high = max(prices[-20:]) if len(prices) >= 20 else max(prices)
-            recent_low  = min(prices[-20:]) if len(prices) >= 20 else min(prices)
+            # تحقق من حد الخسارة اليومية
+            if state["daily_loss_today"] >= state["daily_loss_limit_sol"]:
+                await app.bot.send_message(owner, "🛑 تجاوزت حد الخسارة اليومية - البوت متوقف حتى الغد.")
+                state["running"] = False
+                break
 
-            # نسبة الانخفاض من القمة
-            drop_from_high = ((price - recent_high) / recent_high) * 100
-            # نسبة الارتداد من القاع
-            bounce_from_low = ((price - recent_low) / recent_low) * 100
+            # جلب التوكنات الجديدة
+            tokens = await get_new_pump_tokens()
+            if not tokens: continue
 
-            log.info(f"SOL: ${price:.2f} | MA5: ${ma5:.2f} | انخفاض: {drop_from_high:.2f}% | ارتداد: {bounce_from_low:.2f}%")
+            for token in tokens:
+                mint = token.get("mint")
+                if not mint or mint in state["seen_tokens"]: continue
+                if mint in state["positions"]: continue
 
-            if not in_pos:
-                # ✅ شروط دخول القناص:
-                # 1. السعر انخفض على الأقل 2% من القمة الأخيرة
-                # 2. بدأ يرتد للأعلى (ارتداد 0.5% على الأقل من القاع)
-                # 3. MA5 بدأ يتجاوز MA10 (إشارة صعود)
-                sniper_entry = (
-                    drop_from_high <= -2.0 and
-                    bounce_from_low >= 0.5 and
-                    ma5 >= ma10
-                )
+                created = token.get("created_timestamp", 0)
+                age_sec = (datetime.now().timestamp() * 1000 - created) / 1000
+                usd_mc = token.get("usd_market_cap", 0)
 
-                if sniper_entry:
-                    usd = state["max_trade_usd"]
-                    ok, reason = safety_check(usd)
-                    if not ok:
-                        await app.bot.send_message(owner, f"⚠️ {reason}")
-                        continue
+                # ✅ شروط الشراء:
+                # عمر التوكن بين 10 ثانية و 3 دقائق (جديد جداً)
+                # ماركت كاب معقول
+                if age_sec < 10 or age_sec > 180: continue
+                if usd_mc < 1000 or usd_mc > 100000: continue
+                if token.get("complete", False): continue
 
-                    sol_amt = usd / price
-                    q = await get_quote(SOL_MINT, USDC_MINT, int(sol_amt * 1_000_000_000))
-                    if q:
-                        sig = await do_swap(q)
-                        if sig:
-                            in_pos = True
-                            entry = price
-                            amt_sol = sol_amt
-                            lowest_price = recent_low
-                            state["total_trades"] += 1
+                state["seen_tokens"].add(mint)
 
-                            await app.bot.send_message(owner, f"""🎯 *القناص أطلق النار!*
+                # اشتري!
+                name = token.get("name", "Unknown")
+                symbol = token.get("symbol", "???")
+
+                await app.bot.send_message(owner, f"""🎯 *وجد القناص هدفاً!*
 ━━━━━━━━━━━━━━━━━━
-🪙 SOL/USDC
-💵 سعر الدخول: `${price:.2f}`
-📦 الكمية: `{sol_amt:.4f} SOL` (≈ `${usd:.2f}`)
+🪙 `{name}` ({symbol})
+⏰ عمره: `{age_sec:.0f}` ثانية
+📊 Market Cap: `${usd_mc:,.0f}`
+💸 أشتري بـ `{state['trade_sol']} SOL` ...""", parse_mode="Markdown")
+
+                sig, token_amount = await buy_token(mint, state["trade_sol"])
+
+                if sig and token_amount > 0:
+                    buy_price = await get_token_price_sol(mint) or 0
+                    state["positions"][mint] = {
+                        "name": name,
+                        "symbol": symbol,
+                        "buy_price": buy_price,
+                        "sol_spent": state["trade_sol"],
+                        "amount": token_amount,
+                        "buy_time": datetime.now().timestamp(),
+                    }
+                    state["total_trades"] += 1
+
+                    await app.bot.send_message(owner, f"""✅ *تم الشراء!*
 ━━━━━━━━━━━━━━━━━━
-📉 انخفض: `{drop_from_high:.1f}%` من القمة
-📈 ارتد: `{bounce_from_low:.1f}%` من القاع
-━━━━━━━━━━━━━━━━━━
-🎯 هدف الربح: `${price*1.10:.2f}` (+10%)
-🛑 وقف الخسارة: `${price*0.95:.2f}` (-5%)
+🪙 `{name}` ({symbol})
+💸 `{state['trade_sol']} SOL` (≈ `${state['trade_sol']*sol_price:.2f}`)
+🎯 هدف البيع: *+{state['take_profit']}%*
+🛑 وقف الخسارة: *-{state['stop_loss']}%*
+⏰ سيبيع بعد `{state['max_hold_minutes']}` دقيقة إذا لم يصل للهدف
 🔗 [Solscan](https://solscan.io/tx/{sig})""", parse_mode="Markdown")
-                        else:
-                            await app.bot.send_message(owner, "⚠️ فرصة رصدها القناص لكن فشل التنفيذ - سيحاول مجدداً")
-
-            else:
-                pct = ((price - entry) / entry) * 100
-
-                if pct >= 10.0:
-                    should_sell = True
-                    sell_reason = "🎯 هدف +10% تحقق!"
-                elif pct <= -5.0:
-                    should_sell = True
-                    sell_reason = "🛑 وقف الخسارة -5%"
-                elif pct >= 5.0 and ma5 < ma10:
-                    should_sell = True
-                    sell_reason = "📉 انعكاس الاتجاه عند +5%"
+                    break  # اشتر توكن واحد في كل دورة
                 else:
-                    should_sell = False
-                    sell_reason = ""
+                    await app.bot.send_message(owner, f"⚠️ فشل شراء `{symbol}` - Jupiter لا يدعمه بعد", parse_mode="Markdown")
 
-                if should_sell:
-                    q = await get_quote(USDC_MINT, SOL_MINT, int(amt_sol * price * 1_000_000))
-                    if q:
-                        sig = await do_swap(q)
-                        if sig:
-                            pnl = amt_sol * (price - entry)
-                            is_win = pnl > 0
-                            state["win" if is_win else "lose"] += 1
-                            state["daily_profit_usd"] += pnl
-                            if not is_win:
-                                state["daily_loss_today"] += abs(pnl)
-                            in_pos = False
-                            icon = "✅" if is_win else "❌"
+        except Exception as e:
+            log.error(f"خطأ Sniper: {e}")
+            await asyncio.sleep(15)
 
-                            await app.bot.send_message(owner, f"""{icon} *القناص أغلق الصفقة*
+async def monitor_positions(app):
+    """مراقبة المراكز المفتوحة وبيعها عند الهدف"""
+    owner = state["owner_chat_id"]
+    log.info("👁️ مراقبة المراكز بدأت")
+
+    while state["running"]:
+        await asyncio.sleep(15)
+        if not state["running"]: break
+        if not state["positions"]: continue
+
+        try:
+            sol_price = await get_sol_price()
+
+            for mint in list(state["positions"].keys()):
+                pos = state["positions"].get(mint)
+                if not pos: continue
+
+                age_min = (datetime.now().timestamp() - pos["buy_time"]) / 60
+                current_price = await get_token_price_sol(mint)
+
+                should_sell = False
+                sell_reason = ""
+
+                # تحقق من الوقت
+                if age_min >= state["max_hold_minutes"]:
+                    should_sell = True
+                    sell_reason = f"⏰ انتهى الوقت ({state['max_hold_minutes']} دقيقة)"
+
+                # تحقق من السعر
+                elif current_price and pos["buy_price"] > 0:
+                    pct = ((current_price - pos["buy_price"]) / pos["buy_price"]) * 100
+
+                    if pct >= state["take_profit"]:
+                        should_sell = True
+                        sell_reason = f"🎯 هدف +{state['take_profit']}% تحقق! ({pct:+.1f}%)"
+                    elif pct <= -state["stop_loss"]:
+                        should_sell = True
+                        sell_reason = f"🛑 وقف الخسارة -{state['stop_loss']}% ({pct:+.1f}%)"
+
+                if should_sell and pos.get("amount", 0) > 0:
+                    sig = await sell_token(mint, pos["amount"])
+                    if sig:
+                        # احسب الربح
+                        if current_price and pos["buy_price"] > 0:
+                            pct = ((current_price - pos["buy_price"]) / pos["buy_price"]) * 100
+                            pnl_sol = pos["sol_spent"] * (pct / 100)
+                            pnl_usd = pnl_sol * sol_price
+                        else:
+                            pct = 0; pnl_sol = 0; pnl_usd = 0
+
+                        is_win = pnl_sol >= 0
+                        state["win" if is_win else "lose"] += 1
+                        state["daily_profit_usd"] += pnl_usd
+                        if not is_win:
+                            state["daily_loss_today"] += abs(pnl_sol)
+
+                        del state["positions"][mint]
+                        icon = "✅" if is_win else "❌"
+
+                        await app.bot.send_message(owner, f"""{icon} *بيع - {sell_reason}*
 ━━━━━━━━━━━━━━━━━━
-{sell_reason}
-💵 دخول: `${entry:.2f}` → خروج: `${price:.2f}`
-📊 النتيجة: `{pct:+.2f}%`
-💰 الربح/الخسارة: `${pnl:+.2f}`
+🪙 `{pos['name']}` ({pos['symbol']})
+📊 النتيجة: `{pct:+.1f}%`
+💰 الربح/الخسارة: `{pnl_sol:+.4f} SOL` (≈ `${pnl_usd:+.2f}`)
 ━━━━━━━━━━━━━━━━━━
-📈 أرباح اليوم: `${state['daily_profit_usd']:+.2f}`
+💵 أرباح اليوم: `${state['daily_profit_usd']:+.2f}`
 ✅ `{state['win']}` ❌ `{state['lose']}`
 🔗 [Solscan](https://solscan.io/tx/{sig})""", parse_mode="Markdown")
 
-                            # انتظر قليلاً قبل الصفقة التالية
-                            await asyncio.sleep(60)
-
         except Exception as e:
-            log.error(f"خطأ القناص: {e}")
-            await asyncio.sleep(30)
-
-async def pump_loop(app):
-    owner = state["owner_chat_id"]
-    bought_mints = set()
-    log.info("🚀 Pump.fun loop بدأت")
-
-    while state["running"] and state["pump_enabled"]:
-        await asyncio.sleep(60)
-        if not state["running"] or not state["pump_enabled"]: break
-        try:
-            await get_sol_price()
-            tokens = await get_pump_new_tokens()
-            if not tokens: continue
-
-            good = await filter_pump_tokens(tokens)
-            if not good: continue
-
-            token = good[0]
-            mint = token["mint"]
-            if mint in bought_mints: continue
-            if len(state["active_pump_tokens"]) >= 3: continue
-
-            trade_usd = state["max_trade_usd"]
-            ok, reason = safety_check(trade_usd)
-            if not ok: continue
-
-            sol_price = state["last_sol_price"] or 150
-            sol_amount = trade_usd / sol_price
-
-            await app.bot.send_message(owner, f"""🔍 *توكن Pump.fun جديد!*
-━━━━━━━━━━━━━━━━━━
-🪙 `{token['name']}` ({token['symbol']})
-📊 Market Cap: `${token['market_cap']:,.0f}`
-⏰ عمره: `{token['age_min']} دقيقة`
-💰 سأشتري بـ `${trade_usd}` ...""", parse_mode="Markdown")
-
-            sig = await buy_pump_token(mint, sol_amount)
-            if sig:
-                bought_mints.add(mint)
-                state["active_pump_tokens"].append({
-                    "mint": mint, "symbol": token["symbol"],
-                    "name": token["name"], "sol_spent": sol_amount,
-                    "buy_time": datetime.now().timestamp(),
-                })
-                state["total_trades"] += 1
-                await app.bot.send_message(owner, f"""✅ *شراء Pump.fun تم!*
-🪙 `{token['name']}` ({token['symbol']})
-💰 `{sol_amount:.4f} SOL` (≈ `${trade_usd}`)
-🎯 هدف: +50% | 🛑 وقف: -{state['stop_loss_pct']}%
-🔗 [Solscan](https://solscan.io/tx/{sig})
-⚠️ تداول توكنات جديدة = مخاطرة عالية!""", parse_mode="Markdown")
-            else:
-                await app.bot.send_message(owner, f"❌ فشل شراء `{token['symbol']}` - Jupiter لا يدعمه بعد", parse_mode="Markdown")
-
-            # مراقبة والبيع بعد ساعتين
-            to_remove = []
-            for pos in state["active_pump_tokens"]:
-                age_hours = (datetime.now().timestamp() - pos["buy_time"]) / 3600
-                if age_hours >= 2:
-                    await app.bot.send_message(owner, f"⏰ انتهت مدة `{pos['symbol']}` - يُنصح بالبيع اليدوي", parse_mode="Markdown")
-                    to_remove.append(pos)
-            for pos in to_remove:
-                state["active_pump_tokens"].remove(pos)
-
-        except Exception as e:
-            log.error(f"خطأ Pump loop: {e}")
-            await asyncio.sleep(30)
+            log.error(f"خطأ المراقبة: {e}")
+            await asyncio.sleep(15)
 
 async def daily_report(ctx):
     owner = state["owner_chat_id"]
     if not owner: return
-    a = await chat_with_claude(f"قيّم أداء اليوم: {state['total_trades']} صفقة، ربح ${state['daily_profit_usd']:.2f}، نجاح {state['win']} خسارة {state['lose']}.")
+    a = await chat_with_ai(f"قيّم: {state['total_trades']} صفقة، ربح ${state['daily_profit_usd']:.2f}، نجاح {state['win']} خسارة {state['lose']}.")
     await ctx.bot.send_message(owner, f"""📅 *تقرير {datetime.now().strftime('%Y/%m/%d')}*
-━━━━━━━━━━━━━━━━━━
 🔄 `{state['total_trades']}` | ✅ `{state['win']}` | ❌ `{state['lose']}`
 💵 `${state['daily_profit_usd']:+.2f}`
-━━━━━━━━━━━━━━━━━━
 🤖 {a}""", parse_mode="Markdown")
     state.update({"daily_profit_usd": 0.0, "daily_loss_today": 0.0,
-                  "total_trades": 0, "win": 0, "lose": 0, "chat_history": []})
+                  "total_trades": 0, "win": 0, "lose": 0,
+                  "chat_history": [], "seen_tokens": set()})
 
 def main():
     if not TELEGRAM_TOKEN: print("أضف TELEGRAM_TOKEN!"); return
     if not keypair: print("أضف WALLET_PRIVATE_KEY!"); return
-    print("بوت سولانا المتقدم يبدأ...")
+    print("🎯 بوت Pump.fun القناص يبدأ...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(handle_buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.job_queue.run_daily(daily_report, time=dtime(hour=21, minute=0))
-    print("البوت جاهز مع Pump.fun!")
+    print("✅ القناص جاهز!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
