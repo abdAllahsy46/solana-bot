@@ -66,29 +66,89 @@ async def get_sol_price():
     except: return state["last_sol_price"] or 150.0
 
 async def get_new_pump_tokens():
-    """جلب التوكنات الجديدة من Pump.fun"""
+    """جلب التوكنات الجديدة - يجرب عدة مصادر"""
+    
+    # مصدر 1: DexScreener API (موثوق جداً)
     try:
-        async with httpx.AsyncClient(timeout=15) as h:
+        async with httpx.AsyncClient(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as h:
+            r = await h.get("https://api.dexscreener.com/token-profiles/latest/v1")
+            if r.status_code == 200:
+                data = r.json()
+                tokens = []
+                for item in data:
+                    if item.get("chainId") == "solana":
+                        tokens.append({
+                            "mint": item.get("tokenAddress"),
+                            "name": item.get("description", "Unknown")[:20],
+                            "symbol": item.get("url", "???").split("/")[-1][:10],
+                            "usd_market_cap": 5000,
+                            "created_timestamp": (datetime.now().timestamp() - 60) * 1000,
+                            "complete": False,
+                        })
+                if tokens:
+                    log.info(f"DexScreener: {len(tokens)} توكن")
+                    return tokens
+    except Exception as e:
+        log.error(f"DexScreener error: {e}")
+
+    # مصدر 2: Pump.fun عبر proxy headers
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Origin": "https://pump.fun",
+            "Referer": "https://pump.fun/",
+        }
+        async with httpx.AsyncClient(timeout=15, headers=headers) as h:
             r = await h.get("https://frontend-api.pump.fun/coins",
                            params={"limit": 50, "sort": "created_timestamp",
-                                   "order": "DESC", "includeNsfw": False})
+                                   "order": "DESC", "includeNsfw": "false"})
             if r.status_code == 200:
+                log.info("Pump.fun API يعمل!")
                 return r.json()
     except Exception as e:
         log.error(f"Pump.fun error: {e}")
+
+    # مصدر 3: Bitquery - بيانات Solana
+    try:
+        async with httpx.AsyncClient(timeout=15) as h:
+            r = await h.get("https://streaming.bitquery.io/graphql",
+                           headers={"Content-Type": "application/json"},
+                           content=json.dumps({"query": """{ Solana { DEXTrades(limit: {count: 20} orderBy: {descending: Block_Time} where: {Trade: {Dex: {ProtocolName: {is: "pump"}}}}) { Trade { Buy { Currency { MintAddress Name Symbol } } } } } }"""}))
+            if r.status_code == 200:
+                trades = r.json().get("data", {}).get("Solana", {}).get("DEXTrades", [])
+                tokens = []
+                for t in trades:
+                    cur = t.get("Trade", {}).get("Buy", {}).get("Currency", {})
+                    mint = cur.get("MintAddress")
+                    if mint:
+                        tokens.append({
+                            "mint": mint,
+                            "name": cur.get("Name", "Unknown"),
+                            "symbol": cur.get("Symbol", "???"),
+                            "usd_market_cap": 5000,
+                            "created_timestamp": (datetime.now().timestamp() - 30) * 1000,
+                            "complete": False,
+                        })
+                if tokens:
+                    return tokens
+    except Exception as e:
+        log.error(f"Bitquery error: {e}")
+
     return []
 
 async def get_token_price_sol(mint):
-    """سعر التوكن من Pump.fun مباشرة"""
+    """سعر التوكن من DexScreener"""
     try:
         async with httpx.AsyncClient(timeout=10) as h:
-            r = await h.get(f"https://frontend-api.pump.fun/coins/{mint}")
+            r = await h.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
             if r.status_code == 200:
-                data = r.json()
-                vsr = data.get("virtual_sol_reserves", 0)
-                vtr = data.get("virtual_token_reserves", 0)
-                if vsr > 0 and vtr > 0:
-                    return vsr / vtr
+                pairs = r.json().get("pairs", [])
+                if pairs:
+                    price_usd = float(pairs[0].get("priceUsd", 0))
+                    sol_price = state["last_sol_price"] or 150
+                    if price_usd > 0 and sol_price > 0:
+                        return price_usd / sol_price
     except: pass
     return None
 
