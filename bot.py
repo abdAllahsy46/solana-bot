@@ -360,41 +360,87 @@ async def handle_message(update, ctx):
     await thinking.edit_text(f"🤖 {reply}", reply_markup=kb())
 
 async def trading_loop(app):
+    """
+    استراتيجية تداول SOL نشطة:
+    - يجمع 12 قراءة سعر كل 30 ثانية (6 دقائق إجمالاً)
+    - يحسب المتوسط المتحرك القصير والطويل
+    - يشتري عند تقاطع المتوسطات صعوداً
+    - يبيع عند تحقيق الهدف أو الوقف
+    """
     owner = state["owner_chat_id"]
-    last_price = await get_sol_price()
-    in_pos = False; entry = 0.0; amt_sol = 0.0
+    prices = []  # سجل الأسعار
+    in_pos = False
+    entry = 0.0
+    amt_sol = 0.0
+
+    log.info("🚀 حلقة التداول SOL بدأت")
+    await app.bot.send_message(owner, "🟡 *البوت يراقب سعر SOL الآن...*\nسيشتري عند أول فرصة مناسبة!", parse_mode="Markdown")
 
     while state["running"]:
-        await asyncio.sleep(300)
+        await asyncio.sleep(30)  # كل 30 ثانية
         if not state["running"]: break
         try:
             price = await get_sol_price()
             sol = await get_balance_sol()
             state["current_balance_sol"] = sol
-            chg = ((price - last_price) / last_price) * 100
+            prices.append(price)
 
-            if not in_pos and chg >= 0.5:
-                usd = state["max_trade_usd"]
-                ok, reason = safety_check(usd)
-                if not ok:
-                    await app.bot.send_message(owner, f"⚠️ {reason}")
-                    last_price = price; continue
+            # احتفظ بآخر 20 قراءة فقط
+            if len(prices) > 20:
+                prices.pop(0)
 
-                sol_amt = usd / price
-                q = await get_quote(SOL_MINT, USDC_MINT, int(sol_amt * 1_000_000_000))
-                if q:
-                    sig = await do_swap(q)
-                    if sig:
-                        in_pos = True; entry = price; amt_sol = sol_amt
-                        state["total_trades"] += 1
-                        await app.bot.send_message(owner, f"""🟢 *شراء SOL/USDC*
-💵 `${price:.2f}` | 📦 `{sol_amt:.4f} SOL`
-🎯 هدف: `${price*1.01:.2f}` | 🛑 وقف: `${price*0.997:.2f}`
+            if len(prices) < 6:
+                continue  # انتظر حتى تتجمع بيانات كافية
+
+            # المتوسط المتحرك القصير (3 قراءات) والطويل (6 قراءات)
+            ma_short = sum(prices[-3:]) / 3
+            ma_long = sum(prices[-6:]) / 6
+            chg_1min = ((price - prices[-3]) / prices[-3]) * 100 if len(prices) >= 3 else 0
+
+            log.info(f"SOL: ${price:.2f} | MA3: ${ma_short:.2f} | MA6: ${ma_long:.2f} | تغير: {chg_1min:+.2f}%")
+
+            if not in_pos:
+                # شرط الشراء: MA القصير فوق MA الطويل + ارتفاع خلال دقيقة
+                if ma_short > ma_long and chg_1min >= 0.2:
+                    usd = state["max_trade_usd"]
+                    ok, reason = safety_check(usd)
+                    if not ok:
+                        await app.bot.send_message(owner, f"⚠️ {reason}")
+                        continue
+
+                    sol_amt = usd / price
+                    q = await get_quote(SOL_MINT, USDC_MINT, int(sol_amt * 1_000_000_000))
+                    if q:
+                        sig = await do_swap(q)
+                        if sig:
+                            in_pos = True; entry = price; amt_sol = sol_amt
+                            state["total_trades"] += 1
+                            await app.bot.send_message(owner, f"""🟢 *شراء SOL!*
+━━━━━━━━━━━━━━━
+💵 سعر الدخول: `${price:.2f}`
+📦 الكمية: `{sol_amt:.4f} SOL` (≈ `${usd:.2f}`)
+📈 MA قصير: `${ma_short:.2f}` > MA طويل: `${ma_long:.2f}`
+━━━━━━━━━━━━━━━
+🎯 هدف: `${price*1.015:.2f}` (+1.5%)
+🛑 وقف: `${price*0.99:.2f}` (-1%)
 🔗 [Solscan](https://solscan.io/tx/{sig})""", parse_mode="Markdown")
+                        else:
+                            log.warning("فشل تنفيذ الصفقة")
 
-            elif in_pos:
+            else:
                 pct = ((price - entry) / entry) * 100
-                if pct >= 1.0 or pct <= -0.3:
+
+                # هدف الربح 1.5% أو وقف خسارة 1%
+                if pct >= 1.5:
+                    should_sell = True; sell_reason = "🎯 تحقق هدف +1.5%"
+                elif pct <= -1.0:
+                    should_sell = True; sell_reason = "🛑 وقف الخسارة -1%"
+                elif ma_short < ma_long and pct > 0:
+                    should_sell = True; sell_reason = "📉 انعكاس الاتجاه"
+                else:
+                    should_sell = False; sell_reason = ""
+
+                if should_sell:
                     q = await get_quote(USDC_MINT, SOL_MINT, int(amt_sol * price * 1_000_000))
                     if q:
                         sig = await do_swap(q)
@@ -405,15 +451,18 @@ async def trading_loop(app):
                             if pnl < 0: state["daily_loss_today"] += abs(pnl)
                             in_pos = False
                             icon = "✅" if pnl > 0 else "❌"
-                            await app.bot.send_message(owner, f"""{icon} *بيع {'ربح' if pnl > 0 else 'خسارة'}*
-📊 `{pct:+.2f}%` | 💰 `${pnl:+.2f}`
-💵 اليوم: `${state['daily_profit_usd']:+.2f}`
+                            await app.bot.send_message(owner, f"""{icon} *بيع SOL - {sell_reason}*
+━━━━━━━━━━━━━━━
+💵 دخول: `${entry:.2f}` ← خروج: `${price:.2f}`
+📊 النتيجة: `{pct:+.2f}%`
+💰 الربح/الخسارة: `${pnl:+.2f}`
+━━━━━━━━━━━━━━━
+💵 أرباح اليوم: `${state['daily_profit_usd']:+.2f}`
 🔗 [Solscan](https://solscan.io/tx/{sig})""", parse_mode="Markdown")
-            last_price = price
 
         except Exception as e:
             log.error(f"خطأ التداول: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 
 async def pump_loop(app):
     owner = state["owner_chat_id"]
