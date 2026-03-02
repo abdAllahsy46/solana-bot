@@ -158,14 +158,9 @@ async def buy_token(mint, sol_amount):
     try:
         lamports = int(sol_amount * 1_000_000_000)
         async with httpx.AsyncClient(timeout=20) as h:
-            # جلب بيانات التوكن من Pump.fun
             expected_tokens = int(lamports * 1000)
 
-            # حساب الكمية المتوقعة
-            price = vsr / vtr
-            expected_tokens = int(lamports / price * 0.85)  # 15% slippage
-
-            # طلب الشراء عبر Pump.fun trade API
+            # طلب الشراء عبر PumpPortal API
             payload = {
                 "publicKey": str(keypair.pubkey()),
                 "action": "buy",
@@ -471,11 +466,9 @@ async def pump_sniper_loop(app):
                 age_sec = (datetime.now().timestamp() * 1000 - created) / 1000
                 usd_mc = token.get("usd_market_cap", 0)
 
-                # ✅ شروط الشراء:
-                # عمر التوكن بين 10 ثانية و 3 دقائق (جديد جداً)
-                # ماركت كاب معقول
-                if age_sec < 10 or age_sec > 180: continue
-                if usd_mc < 1000 or usd_mc > 100000: continue
+                # ✅ شروط الشراء مخففة
+                if age_sec < 5: continue           # أحدث من 5 ثواني نتجاهله
+                if age_sec > 600: continue         # أقدم من 10 دقائق نتجاهله
                 if token.get("complete", False): continue
 
                 state["seen_tokens"].add(mint)
@@ -515,7 +508,7 @@ async def pump_sniper_loop(app):
 🔗 [Solscan](https://solscan.io/tx/{sig})""", parse_mode="Markdown")
                     break  # اشتر توكن واحد في كل دورة
                 else:
-                    await app.bot.send_message(owner, f"⚠️ فشل شراء `{symbol}` - Jupiter لا يدعمه بعد", parse_mode="Markdown")
+                    await app.bot.send_message(owner, f"⚠️ فشل شراء `{symbol}` - سيحاول التوكن التالي", parse_mode="Markdown")
 
         except Exception as e:
             log.error(f"خطأ Sniper: {e}")
