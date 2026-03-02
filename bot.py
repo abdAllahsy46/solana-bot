@@ -159,13 +159,7 @@ async def buy_token(mint, sol_amount):
         lamports = int(sol_amount * 1_000_000_000)
         async with httpx.AsyncClient(timeout=20) as h:
             # جلب بيانات التوكن من Pump.fun
-            r = await h.get(f"https://frontend-api.pump.fun/coins/{mint}")
-            if r.status_code != 200: return None, 0
-            coin = r.json()
-
-            vsr = coin.get("virtual_sol_reserves", 0)
-            vtr = coin.get("virtual_token_reserves", 0)
-            if vsr == 0 or vtr == 0: return None, 0
+            expected_tokens = int(lamports * 1000)
 
             # حساب الكمية المتوقعة
             price = vsr / vtr
