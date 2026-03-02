@@ -153,38 +153,37 @@ async def get_token_price_sol(mint):
     return None
 
 async def buy_token(mint, sol_amount):
-    """شراء توكن مباشرة عبر Pump.fun"""
+    """شراء توكن مباشرة عبر PumpPortal"""
     if not keypair: return None, 0
     try:
-        lamports = int(sol_amount * 1_000_000_000)
-        async with httpx.AsyncClient(timeout=20) as h:
-            expected_tokens = int(lamports * 1000)
-
-            # طلب الشراء عبر PumpPortal API
+        async with httpx.AsyncClient(timeout=30) as h:
             payload = {
                 "publicKey": str(keypair.pubkey()),
                 "action": "buy",
                 "mint": mint,
-                "amount": lamports,
+                "amount": sol_amount,          # SOL مباشرة وليس lamports
                 "denominatedInSol": "true",
-                "slippage": 25,
-                "priorityFee": 0.003,
+                "slippage": 50,                # slippage عالي للتوكنات الجديدة
+                "priorityFee": 0.005,          # رسوم أعلى للسرعة
                 "pool": "pump"
             }
-            r2 = await h.post("https://pumpportal.fun/api/trade-local", json=payload)
-            if r2.status_code != 200:
-                log.error(f"Pump trade error: {r2.status_code} {r2.text[:100]}")
+            log.info(f"محاولة شراء {mint} بـ {sol_amount} SOL")
+            r = await h.post("https://pumpportal.fun/api/trade-local", json=payload)
+            log.info(f"PumpPortal response: {r.status_code}")
+
+            if r.status_code != 200:
+                log.error(f"PumpPortal error: {r.status_code} - {r.text[:200]}")
                 return None, 0
 
-            tx_data = r2.content
-            tx = VersionedTransaction.from_bytes(tx_data)
+            tx = VersionedTransaction.from_bytes(r.content)
             tx.sign([keypair])
 
             async with AsyncClient(RPC_URL) as c:
                 res = await c.send_raw_transaction(bytes(tx),
                     opts={"skip_preflight": True, "preflight_commitment": "confirmed"})
                 sig = str(res.value)
-                log.info(f"✅ شراء ناجح: {sig}")
+                log.info(f"✅ شراء ناجح! {sig}")
+                expected_tokens = int(sol_amount * 1_000_000_000 * 1000)
                 return sig, expected_tokens
 
     except Exception as e:
