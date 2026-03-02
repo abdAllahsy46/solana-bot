@@ -79,78 +79,97 @@ async def get_new_pump_tokens():
     return []
 
 async def get_token_price_sol(mint):
-    """سعر التوكن بالـ SOL عبر Jupiter"""
+    """سعر التوكن من Pump.fun مباشرة"""
     try:
         async with httpx.AsyncClient(timeout=10) as h:
-            r = await h.get("https://price.jup.ag/v6/price",
-                           params={"ids": mint, "vsToken": SOL_MINT})
+            r = await h.get(f"https://frontend-api.pump.fun/coins/{mint}")
             if r.status_code == 200:
-                data = r.json().get("data", {})
-                if mint in data:
-                    return float(data[mint]["price"])
+                data = r.json()
+                vsr = data.get("virtual_sol_reserves", 0)
+                vtr = data.get("virtual_token_reserves", 0)
+                if vsr > 0 and vtr > 0:
+                    return vsr / vtr
     except: pass
     return None
 
 async def buy_token(mint, sol_amount):
-    """شراء توكن بكمية SOL محددة"""
+    """شراء توكن مباشرة عبر Pump.fun"""
     if not keypair: return None, 0
     try:
         lamports = int(sol_amount * 1_000_000_000)
         async with httpx.AsyncClient(timeout=20) as h:
-            # جلب الـ quote
-            r = await h.get("https://quote-api.jup.ag/v6/quote",
-                           params={"inputMint": SOL_MINT, "outputMint": mint,
-                                   "amount": lamports, "slippageBps": 2000})
+            # جلب بيانات التوكن من Pump.fun
+            r = await h.get(f"https://frontend-api.pump.fun/coins/{mint}")
             if r.status_code != 200: return None, 0
-            quote = r.json()
-            out_amount = int(quote.get("outAmount", 0))
+            coin = r.json()
 
-            # تنفيذ الصفقة
-            swap = await h.post("https://quote-api.jup.ag/v6/swap", json={
-                "quoteResponse": quote,
-                "userPublicKey": str(keypair.pubkey()),
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": 10000,
-            })
-            if swap.status_code != 200: return None, 0
+            vsr = coin.get("virtual_sol_reserves", 0)
+            vtr = coin.get("virtual_token_reserves", 0)
+            if vsr == 0 or vtr == 0: return None, 0
 
-            tx = VersionedTransaction.from_bytes(base58.b58decode(swap.json()["swapTransaction"]))
+            # حساب الكمية المتوقعة
+            price = vsr / vtr
+            expected_tokens = int(lamports / price * 0.85)  # 15% slippage
+
+            # طلب الشراء عبر Pump.fun trade API
+            payload = {
+                "publicKey": str(keypair.pubkey()),
+                "action": "buy",
+                "mint": mint,
+                "amount": lamports,
+                "denominatedInSol": "true",
+                "slippage": 25,
+                "priorityFee": 0.003,
+                "pool": "pump"
+            }
+            r2 = await h.post("https://pumpportal.fun/api/trade-local", json=payload)
+            if r2.status_code != 200:
+                log.error(f"Pump trade error: {r2.status_code} {r2.text[:100]}")
+                return None, 0
+
+            tx_data = r2.content
+            tx = VersionedTransaction.from_bytes(tx_data)
             tx.sign([keypair])
+
             async with AsyncClient(RPC_URL) as c:
                 res = await c.send_raw_transaction(bytes(tx),
                     opts={"skip_preflight": True, "preflight_commitment": "confirmed"})
-                return str(res.value), out_amount
+                sig = str(res.value)
+                log.info(f"✅ شراء ناجح: {sig}")
+                return sig, expected_tokens
+
     except Exception as e:
         log.error(f"خطأ الشراء: {e}")
         return None, 0
 
 async def sell_token(mint, token_amount):
-    """بيع كل التوكنات"""
+    """بيع توكن مباشرة عبر Pump.fun"""
     if not keypair: return None
     try:
         async with httpx.AsyncClient(timeout=20) as h:
-            r = await h.get("https://quote-api.jup.ag/v6/quote",
-                           params={"inputMint": mint, "outputMint": SOL_MINT,
-                                   "amount": token_amount, "slippageBps": 2500})
-            if r.status_code != 200: return None
-            quote = r.json()
+            payload = {
+                "publicKey": str(keypair.pubkey()),
+                "action": "sell",
+                "mint": mint,
+                "amount": token_amount,
+                "denominatedInSol": "false",
+                "slippage": 25,
+                "priorityFee": 0.003,
+                "pool": "pump"
+            }
+            r = await h.post("https://pumpportal.fun/api/trade-local", json=payload)
+            if r.status_code != 200:
+                log.error(f"Pump sell error: {r.status_code}")
+                return None
 
-            swap = await h.post("https://quote-api.jup.ag/v6/swap", json={
-                "quoteResponse": quote,
-                "userPublicKey": str(keypair.pubkey()),
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": 10000,
-            })
-            if swap.status_code != 200: return None
-
-            tx = VersionedTransaction.from_bytes(base58.b58decode(swap.json()["swapTransaction"]))
+            tx = VersionedTransaction.from_bytes(r.content)
             tx.sign([keypair])
+
             async with AsyncClient(RPC_URL) as c:
                 res = await c.send_raw_transaction(bytes(tx),
                     opts={"skip_preflight": True, "preflight_commitment": "confirmed"})
                 return str(res.value)
+
     except Exception as e:
         log.error(f"خطأ البيع: {e}")
         return None
